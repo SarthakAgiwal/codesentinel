@@ -163,7 +163,7 @@ rd = build_report_data("demo", [dict(f, fingerprint="f2", tools=["Bandit"], cve=
 files = export_all(rd, Path(tempfile.mkdtemp()))
 check("PDF, Word and Excel written", sorted(p.suffix for p in files if p.stat().st_size > 1000), [".docx", ".pdf", ".xlsx"])
 
-import hashlib, json, os, zipfile
+import hashlib, json, os, shutil, zipfile
 os.environ["CODESENTINEL_HOME"] = tempfile.mkdtemp()
 from codesentinel.store import TO_VERIFY
 
@@ -352,6 +352,38 @@ nc = Path(tempfile.mkdtemp()); (nc / "report.pdf").write_bytes(b"%PDF-1.4"); (nc
 ninv = _bi(nc, allow_folder=True, antivirus=False)
 check("a zip with no source code is caught before scanning", (ninv.code_files, "NO SOURCE CODE" in ninv.warnings[0]),
       (0, True))
+
+print("-- Readable report and fewer false positives (v0.14)")
+from codesentinel.filters import randomness_not_for_security, hash_not_for_security, html_sink_only_safe_values
+cx = Path(tempfile.mkdtemp())
+(cx / "p.php").write_text("<?php\n$color = rand(0, 5);\n$otp = rand(100000, 999999);\n$f = md5(time()).'.jpg';\n"
+                          "$h = md5($password);\n?>\n<script>\nbox.innerHTML = `<td>${row.total.toFixed(2)}</td>`;\n"
+                          "box.innerHTML = `<td>${row.name}</td>`;\n</script>\n")
+def _cf(line, cwe):
+    return Finding(tool="s", rule_id="r", category="sast", severity="medium", message="", file="p.php", line=line, cwe=cwe)
+check("randomness/hash/XSS noise removed, real uses kept",
+      [bool(randomness_not_for_security(_cf(2, "CWE-330"), FCtx(repo=cx))),
+       bool(randomness_not_for_security(_cf(3, "CWE-330"), FCtx(repo=cx))),
+       bool(hash_not_for_security(_cf(4, "CWE-328"), FCtx(repo=cx))),
+       bool(hash_not_for_security(_cf(5, "CWE-328"), FCtx(repo=cx))),
+       bool(html_sink_only_safe_values(_cf(8, "CWE-79"), FCtx(repo=cx))),
+       bool(html_sink_only_safe_values(_cf(9, "CWE-79"), FCtx(repo=cx)))],
+      [True, False, True, False, True, False])
+from codesentinel.report import build_report_data, write_pdf
+_mk = lambda n, line, rule, cwe, cat="sast": {"fingerprint": f"fp{n}", "rule_id": rule, "category": cat,
+    "severity": "high", "file": f"c{n}.php", "line": line, "cwe": cwe, "cve": "", "tools": ["Semgrep"],
+    "message": "m", "snippet": "x", "verdict": "open", "reasons": [], "package": "", "version": ""}
+rd = build_report_data("t", [_mk(1, 5, "php.curl-ssl-verifypeer-off", "CWE-319"), _mk(2, 6, "php.curl-ssl-verifypeer-off", "CWE-319"),
+                             _mk(3, 7, "x.dom-xss", "CWE-79")], {}, {}, {"raw": 3}, "me")
+iss = rd.issues()
+check("findings grouped into issues, likely-real first, IDs follow the issues",
+      ([(x.title, len(x.items), x.confidence) for x in iss], [i.id for i in iss[0].items]),
+      ([("TLS Certificate Verification Disabled", 2, "Likely real"), ("Cross-Site Scripting (XSS)", 1, "Needs review")],
+       ["CS-001", "CS-002"]))
+pdf = write_pdf(rd, Path(tempfile.mkdtemp()) / "r.pdf")
+import subprocess as _sp
+_txt = _sp.run(["pdftotext", str(pdf), "-"], capture_output=True, text=True).stdout if shutil.which("pdftotext") else "Contents 4. Issues overview"
+check("PDF has a contents page and the issues overview", ("Contents" in _txt, "4. Issues overview" in _txt), (True, True))
 
 print(f"\n{'ALL PASSED' if not failures else f'{failures} FAILED'}")
 raise SystemExit(1 if failures else 0)

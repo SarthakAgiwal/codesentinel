@@ -44,13 +44,19 @@ class Finding:
         d["fingerprint"] = self.fingerprint
         all_secrets = set(secrets) | ({self.match} if self.match else set())
         for s in sorted(all_secrets, key=len, reverse=True):   # longest first
-            if len(s) < 6:
+            if len(s) < 6 or s.strip().lower() in _NOT_SECRETS:
                 continue
             masked = mask_secret(s)
             for k in ("snippet", "message", "match"):
                 d[k] = d[k].replace(s, masked)
         d["snippet"] = redact_code(d["snippet"], self.file)
         return d
+
+
+# words a scanner sometimes reports as the "secret" (the variable name, not its value) - masking them would
+# garble every message that mentions them
+_NOT_SECRETS = {"password", "passwd", "secret", "secrets", "token", "apikey", "api_key", "private_key", "privatekey",
+                "credential", "credentials", "secret_key", "access_token", "auth_token", "client_secret"}
 
 
 def mask_secret(value: str) -> str:

@@ -57,7 +57,9 @@ def dedupe(findings: list[Finding]) -> list[Finding]:
             # each config rule is a separate fix (e.g. two missing settings on one service)
             key = ("iac", f.rule_id, f.file, f.line)
         else:
-            key = (f.category, f.cwe or f.rule_id, f.file)
+            # scanners tag "TLS check switched off" as CWE-295 or CWE-319 - same issue
+            cwe = {"CWE-295": "CWE-319"}.get(f.cwe, f.cwe)
+            key = (f.category, cwe or f.rule_id, f.file)
         bucket = groups.setdefault(key, [])
         cands = [k for k in bucket if f.category == "sca" or _same_issue(k, f)]
         # several candidates: join the closest one (same line beats "a few lines away")

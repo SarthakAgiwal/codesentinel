@@ -373,6 +373,86 @@ def regex_input_escaped(f: Finding, ctx: "Context") -> str | None:
     return "Input is escaped before the RegExp is built (matches literally)" if _ESCAPED_REGEX.search(window) else None
 
 
+# ---------------------------------------------------------------- 1b. context checks for noisy weakness classes
+def _window(f: Finding, ctx: "Context", before: int, after: int) -> str | None:
+    if not ctx.repo or not f.file or not f.line:
+        return None
+    try:
+        lines = (ctx.repo / f.file).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    return "\n".join(lines[max(0, f.line - 1 - before):f.line + after])
+
+
+_SECURITY_USE = re.compile(r"(?i)otp|token|passw|pwd|secret|\bkey|api_?key|salt|nonce|session|csrf|xsrf|reset|"
+                           r"verif|auth|captcha|\bpin\b|\bcode\b|txn|transaction|order_?id|orderid|payment|"
+                           r"invoice|ref(?:erence)?_?(?:no|id)|voucher|coupon|uuid|guid|hash|sign|crypt|cookie")
+
+
+def randomness_not_for_security(f: Finding, ctx: "Context") -> str | None:
+    """rand()/Math.random() used for display, colours, delays or file names - not for anything an attacker must
+    not guess. Kept when the value is named or used like an OTP, token, password, ID or payment reference."""
+    if f.cwe not in ("CWE-330", "CWE-338") or f.category != "sast":
+        return None
+    w = _window(f, ctx, 0, 4)
+    if w is None:
+        return None
+    lines = w.splitlines()
+    if not lines or _SECURITY_USE.search(lines[0]):
+        return None
+    m = re.search(r"([$\w.\[\]'\"-]+)\s*(?:=|:)\s*[^=]", lines[0])     # the variable that receives the value
+    var = m.group(1).split("[")[0].strip() if m else ""
+    if var and any(var in l and _SECURITY_USE.search(l) for l in lines[1:]):
+        return None                                   # e.g. $n = mt_rand(); ... $_SESSION['captcha'] = $n;
+    return "Random value is not used for anything security-related (no token, OTP, password, ID or payment reference)"
+
+
+_NON_SECURITY_HASH = re.compile(r"(?i)cache|etag|checksum|file_?name|filename|avatar|gravatar|dedup|fingerprint_"
+                                r"|color|colour|asset|version|integrity check|md5_file|sha1_file|unique file|\$file\b|upload|"
+                                r"image|img|\.(?:jpe?g|png|gif|pdf|csv|xlsx?)\b")
+_SECURITY_HASH = re.compile(r"(?i)passw|pwd|secret|token|sign|auth|otp|session|hmac|salt|api_?key")
+
+
+def hash_not_for_security(f: Finding, ctx: "Context") -> str | None:
+    """MD5/SHA-1 used for cache keys, file names or checksums is not a cryptographic weakness."""
+    if f.cwe not in ("CWE-327", "CWE-328", "CWE-916") or f.category != "sast":
+        return None
+    w = _window(f, ctx, 0, 0)
+    if w is None or _SECURITY_HASH.search(w):
+        return None
+    return "Hash used for a non-security purpose (cache key, file name or checksum)" if _NON_SECURITY_HASH.search(w) else None
+
+
+_SAFE_EXPR = re.compile(r"""(?x)^\s*(?:
+      [\d.]+                                                   # number
+    | ['"][^'"<>]*['"]                                          # plain string without markup
+    | [\w.$\[\]'"]+\.(?:toFixed|toLocaleString|toPrecision|length)\b.*   # numeric formatting / length
+    | (?:parseInt|parseFloat|Number|Math\.\w+|encodeURIComponent|encodeURI|escapeHtml|escapeHTML|htmlEscape|
+         _\.escape|DOMPurify\.sanitize|he\.encode|sanitize\w*|esc|htmlspecialchars|htmlentities|json_encode|
+         number_format|intval|count|date)\s*\(.*
+    | [\w$]*(?:index|idx|count|total|num|len|length|amount|qty|i|j|k|page|percent|width|height)[\w$]*
+    )\s*$""")
+
+
+def html_sink_only_safe_values(f: Finding, ctx: "Context") -> str | None:
+    """innerHTML / .html() / echo flagged, but every value written is a number, a fixed string or already escaped."""
+    if f.cwe not in ("CWE-79", "CWE-80") or f.category != "sast":
+        return None
+    w = _window(f, ctx, 0, 0)
+    if not w:
+        return None
+    parts = re.findall(r"\$\{([^}]*)\}", w)                          # template literal values
+    m = re.search(r"(?:innerHTML|outerHTML)\s*\+?=\s*(.*)$|\.(?:html|append|prepend)\s*\((.*)\)\s*;?\s*$", w)
+    if m and not parts:
+        expr = (m.group(1) or m.group(2) or "").rstrip(";")
+        parts = [x for x in re.split(r"\s\+\s|\+(?=\s*[\w$(])", expr)]
+        parts = [x for x in parts if not re.fullmatch(r"""\s*(['"`])[^'"`]*\1\s*""", x)]  # drop literal pieces
+    if not parts:
+        return None
+    return ("Only numbers, fixed text or escaped values are written into the page"
+            if all(_SAFE_EXPR.match(x) for x in parts) else None)
+
+
 # ---------------------------------------------------------------- 1c. third-party libraries copied into the source
 VENDOR_LIB_DIRS = {"plugins", "plugin", "vendors", "libs", "bower", "jspm_packages", "external", "externals"}
 PUBLIC_DIRS = {"assets", "public", "static", "wwwroot", "scripts", "content", "web", "www", "resources", "js",
@@ -415,7 +495,8 @@ def third_party_library(f: Finding, ctx: "Context") -> str | None:
 
 
 FILTERS = [suppressed_by_file, scanner_report, non_prod_path, test_fixture_secret, import_only,
-           placeholder_secret, dev_only_dependency, lockfile_pinned, regex_input_escaped, third_party_library]
+           placeholder_secret, dev_only_dependency, lockfile_pinned, regex_input_escaped, third_party_library,
+           randomness_not_for_security, hash_not_for_security, html_sink_only_safe_values]
 FILTER_LABELS = {
     "suppressed_by_file": "Accepted in ignore file",
     "scanner_report": "Inside an old scanner report",
@@ -427,6 +508,9 @@ FILTER_LABELS = {
     "lockfile_pinned": "Versions pinned by a lock file",
     "regex_input_escaped": "Regex input escaped",
     "third_party_library": "Third-party library copied into the source",
+    "randomness_not_for_security": "Random value not used for security",
+    "hash_not_for_security": "Hash not used for security",
+    "html_sink_only_safe_values": "Only safe values written to the page",
 }
 
 

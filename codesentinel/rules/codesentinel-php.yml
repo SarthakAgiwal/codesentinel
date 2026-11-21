@@ -123,3 +123,28 @@ rules:
       cwe: ["CWE-489: Active Debug Code"]
       confidence: HIGH
     pattern-regex: \A\s*<\?php
+
+  - id: codesentinel.tls.certificate-verification-disabled
+    languages: [regex]
+    severity: ERROR
+    paths:
+      include: ["*.php", "*.py", "*.js", "*.ts", "*.cs", "*.java", "*.go", "*.rb"]
+    message: >-
+      TLS certificate verification is switched off for this outgoing connection, so the application accepts any
+      certificate. Anyone on the network path can impersonate the remote server, read what is sent (API keys,
+      customer data) and change the response (for example a payment status). Turn verification back on; if the
+      server uses a private CA, trust that CA instead.
+    metadata:
+      category: security
+      cwe: ["CWE-295: Improper Certificate Validation"]
+      confidence: HIGH
+    pattern-either:
+      - pattern-regex: CURLOPT_SSL_VERIFYPEER\s*(?:,|=>)\s*(?:false|FALSE|0)\b
+      - pattern-regex: CURLOPT_SSL_VERIFYHOST\s*(?:,|=>)\s*(?:false|FALSE|0|1)\b
+      - pattern-regex: \bverify\s*=\s*False\b
+      - pattern-regex: rejectUnauthorized\s*:\s*false
+      - pattern-regex: NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*['"]?0
+      - pattern-regex: ServerCertificateValidationCallback\s*(?:\+?=)\s*(?:\([^)]*\)|\w+)\s*=>\s*true
+      - pattern-regex: ServerCertificateCustomValidationCallback\s*=\s*(?:\([^)]*\)|\w+)\s*=>\s*true
+      - pattern-regex: InsecureSkipVerify\s*:\s*true
+

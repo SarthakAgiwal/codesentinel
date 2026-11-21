@@ -97,11 +97,86 @@ class ReportItem:
     intel: str = ""                  # CISA KEV / EPSS for CVEs
     fix: dict = field(default_factory=dict)   # personal fix (ai_fix.Fix.to_dict) when one exists
     exploited: bool = False          # in the CISA KEV catalog
+    rule: str = ""                   # scanner rule id (for grouping and confidence)
+    confidence: str = ""             # "Likely real" | "Needs review"
+    why: str = ""                    # why that confidence
 
     @property
     def verified(self) -> bool:
         """True positive confirmed by a person (Confirmed / Urgent / Accepted Risk)."""
         return self.state in (CONFIRMED, URGENT, ACCEPTED)
+
+
+# Rules whose result is a fact read straight from the code (a setting, a literal, a version), not a guess about
+# data flow - these are reported as "Likely real".
+LIKELY_REAL_RULES = ("ssl-verify", "certificate-verification-disabled", "ssl_verify", "verifypeer", "verifyhost", "disabled-cert", "reject-unauthorized",
+                     "cookie-without-httponly", "hardcoded-credential", "hard-coded", "test-endpoint",
+                     "codesentinel.lib.vulnerable", "display-errors", "debug-enabled", "debug=true", "csrf-disabled",
+                     "no-auth", "insecure-transport", "use-of-md5", "use-of-sha1", "weak-hash", "md5", "sha1",
+                     "target-blank", "sensitive-data-in-web-storage", "web-storage")
+
+
+def confidence_of(category: str, rule: str, file: str, verified: bool, ai: str = "") -> tuple[str, str]:
+    if verified:
+        return "Confirmed", "Confirmed by an analyst"
+    if ai:
+        try:
+            pct = int(ai.split("%")[0])
+            if pct >= 70:
+                return "Likely real", f"AI: {pct}% likely real"
+            if pct < 30:
+                return "Needs review", f"AI: only {pct}% likely real"
+        except ValueError:
+            pass
+    r = (rule or "").lower()
+    if category == "sca":
+        return "Likely real", "Installed version is inside the advisory's affected range"
+    if category == "secret":
+        if re.search(r"(?i)(^|/)(docs?|examples?|samples?|tests?|fixtures?)/|readme|\.md$", file or ""):
+            return "Needs review", "Found in documentation or example code"
+        return "Likely real", "A secret value is written in the source"
+    if category in ("iac", "cicd"):
+        return "Likely real", "Read directly from the configuration"
+    if any(k in r for k in LIKELY_REAL_RULES):
+        return "Likely real", "The insecure setting or value is written in the code"
+    if "missing-hsts" in r or "clickjacking" in r:
+        return "Needs review", "May be set by the web server or proxy instead of the code"
+    return "Needs review", "Depends on where the data comes from - check whether a user can control it"
+
+
+@dataclass
+class Issue:
+    """One kind of problem (same title) with all the places it occurs."""
+    ref: str
+    title: str
+    category: str
+    items: list
+
+    @property
+    def severity(self) -> str:
+        return min((i.severity for i in self.items), key=lambda s: SEVERITIES.index(s) if s in SEVERITIES else 9)
+
+    @property
+    def confidence(self) -> str:
+        cs = [i.confidence for i in self.items]
+        return "Confirmed" if "Confirmed" in cs else "Likely real" if "Likely real" in cs else "Needs review"
+
+    @property
+    def files(self) -> int:
+        return len({i.location.rsplit(":", 1)[0] for i in self.items})
+
+    @property
+    def lead(self):
+        """The instance used for the description, code and fix: one with a fix, else the first."""
+        return next((i for i in self.items if i.fix), self.items[0])
+
+    @property
+    def fixed(self) -> str:
+        vs = [i.fixed for i in self.items if i.fixed]
+        if not vs:
+            return ""
+        key = lambda v: tuple(int(x) for x in re.findall(r"\d+", v.split(",")[0])[:4])
+        return max(vs, key=key)
 
 
 @dataclass
@@ -153,6 +228,24 @@ class ReportData:
     def to_verify(self) -> list[ReportItem]:
         return [i for i in self.items if not i.verified]
 
+    def issues(self) -> list[Issue]:
+        """Findings grouped into issues: same problem = one issue, with every location listed under it.
+        Order: confirmed, then likely real, then needs review; inside each by severity."""
+        groups: dict = {}
+        for i in self.items:
+            key = (i.category, i.package) if i.category == "sca" else (i.category, i.title)
+            groups.setdefault(key, []).append(i)
+        conf_rank = {"Confirmed": 0, "Likely real": 1, "Needs review": 2}
+        out = []
+        for (cat, name), its in groups.items():
+            title = (f"Vulnerable dependency: {its[0].package} {its[0].version}" if cat == "sca" else name)
+            out.append(Issue("", title, cat, its))
+        out.sort(key=lambda x: (conf_rank[x.confidence], SEVERITIES.index(x.severity) if x.severity in SEVERITIES
+                                else 9, -len(x.items), x.title))
+        for n, x in enumerate(out, 1):
+            x.ref = f"I-{n:02d}"
+        return out
+
     @property
     def fp_counts(self) -> Counter:
         """False positives removed, by who decided: analyst | ai-approved | ai-pending | rules."""
@@ -163,6 +256,7 @@ class ReportData:
 # Specific rules that deserve a clearer title / advice than their CWE gives (matched on the rule id)
 RULE_INFO = [
     (("ssl-verify", "ssl_verify", "verifypeer", "verifyhost", "disabled-cert-validation", "verify-false",
+      "certificate-verification-disabled",
       "reject-unauthorized", "insecure-transport.requests", "no-verify", "ssl-verification"),
      ("TLS Certificate Verification Disabled",
       "Turn certificate verification back on (CURLOPT_SSL_VERIFYPEER true and CURLOPT_SSL_VERIFYHOST 2 in PHP, "
@@ -187,7 +281,10 @@ def _title(d: dict) -> str:
     if d["category"] == "sca":
         return f"{d['package']} {d['version']}: {d['cve'] or d['rule_id']}"
     if d["category"] == "secret":
-        return "Hard-coded secret: " + d["rule_id"].rsplit(".", 1)[-1].replace("-", " ")
+        name = d["rule_id"].rsplit(".", 1)[-1]
+        name = {"B105": "hard-coded password", "B106": "hard-coded password argument",
+                "B107": "hard-coded password default", "hardcoded-credential": "password or key in the code"}.get(name, name.replace("-", " ").replace("_", " "))
+        return "Hard-coded secret: " + name
     if d["cwe"] in CWE_INFO:
         return CWE_INFO[d["cwe"]][0]
     return d["rule_id"].rsplit(".", 1)[-1].replace("-", " ").replace("_", " ").capitalize()
@@ -256,21 +353,33 @@ def build_report_data(project: str, findings: list[dict], triage: dict, inventor
                 fx = {}
         items.append(ReportItem(
             id="", severity=severity, category=d["category"], title=_title(d), location=_loc(d),
-            cwe=d["cwe"], cve=d["cve"], state=state, tools=", ".join(d["tools"]),
+            cwe=d["cwe"] or ("CWE-798" if d["category"] == "secret" else ""), cve=d["cve"], state=state,
+            tools=", ".join(d["tools"]),
             message=(d.get("message") or "").strip(), snippet=d.get("snippet") or "", line=d.get("line", 0),
             recommendation=_recommendation(d, fixed), note=note, package=d.get("package", ""),
-            version=d.get("version", ""), fixed=fixed, ai=ai, intel=ti["text"], exploited=bool(ti["kev"]), fix=fx or {}))
+            version=d.get("version", ""), fixed=fixed, ai=ai, intel=ti["text"], exploited=bool(ti["kev"]), fix=fx or {},
+            rule=d["rule_id"]))
+        it = items[-1]
+        it.confidence, it.why = confidence_of(it.category, it.rule, d.get("file", ""), it.verified, ai)
     sev_rank = {s: i for i, s in enumerate(SEVERITIES)}
-    items.sort(key=lambda i: (not i.verified, not i.exploited, sev_rank.get(i.severity, 9),
-                              STATE_ORDER.index(i.state), i.location))
-    for n, i in enumerate(items, 1):
-        i.id = f"CS-{n:03d}"
-    return ReportData(project=project, generated=datetime.now().strftime("%d %b %Y %H:%M"), prepared_by=prepared_by,
+    conf_rank = {"Confirmed": 0, "Likely real": 1, "Needs review": 2}
+    items.sort(key=lambda i: (conf_rank.get(i.confidence, 3), not i.exploited, sev_rank.get(i.severity, 9),
+                              i.title, STATE_ORDER.index(i.state), i.location))
+    r = ReportData(project=project, generated=datetime.now().strftime("%d %b %Y %H:%M"), prepared_by=prepared_by,
                       inventory=inventory or {}, scan=scan or {}, items=items, excluded=excluded,
                       totals={"raw": scan.get("raw", 0), "unique": len(findings), "reported": len(items),
                               "excluded": len(excluded)},
                       threat_model=threat_model.to_dict() if hasattr(threat_model, "to_dict") else (threat_model or {}),
                       tm_image=str(tm_image or ""))
+    n = 0
+    ordered = []
+    for issue in r.issues():                       # number findings in report order, issue by issue
+        for i in sorted(issue.items, key=lambda x: (STATE_ORDER.index(x.state), x.location)):
+            n += 1
+            i.id = f"CS-{n:03d}"
+            ordered.append(i)
+    r.items = ordered
+    return r
 
 
 def _loc(d: dict) -> str:
@@ -296,11 +405,15 @@ def summary_sentence(r: ReportData) -> str:
         return "No reportable security findings remained after automatic filtering and analyst review."
     top = [f"{c[s]} {s}" for s in SEVERITIES if c.get(s)]
     urgent = sum(1 for i in r.items if i.state == URGENT)
-    s = (f"The review of {r.project} identified {len(r.items)} reportable finding"
-         f"{'s' if len(r.items) != 1 else ''} ({', '.join(top)}): {len(r.true_positives)} confirmed as true "
-         f"positive{'s' if len(r.true_positives) != 1 else ''} by an analyst and {len(r.to_verify)} still to verify. "
-         f"{len(r.excluded)} false positive{'s were' if len(r.excluded) != 1 else ' was'} removed and "
-         f"{'are' if len(r.excluded) != 1 else 'is'} listed in Appendix A.")
+    iss = r.issues()
+    conf = Counter(i.confidence for i in r.items)
+    s = (f"The review of {r.project} found {len(iss)} distinct issue{'s' if len(iss) != 1 else ''} in "
+         f"{len(r.items)} place{'s' if len(r.items) != 1 else ''} ({', '.join(top)}). "
+         f"{conf.get('Confirmed', 0)} {'were' if conf.get('Confirmed', 0) != 1 else 'was'} confirmed by an analyst, "
+         f"{conf.get('Likely real', 0)} are likely real (the insecure code, secret or version is visible) and "
+         f"{conf.get('Needs review', 0)} need a check of whether a user can reach them. "
+         f"{len(r.excluded)} scanner result{'s were' if len(r.excluded) != 1 else ' was'} proven to be false "
+         f"positive{'s' if len(r.excluded) != 1 else ''} and left out (listed in Appendix A).")
     if c.get("critical") or c.get("high"):
         s += " Critical and high findings should be fixed before release."
     if urgent:
@@ -653,6 +766,8 @@ def write_docx(r: ReportData, path: str | Path) -> Path:
 
 # ---------------------------------------------------------------- PDF
 def write_pdf(r: ReportData, path: str | Path) -> Path:
+    """The PDF: cover, contents, executive summary, scope, method, issue overview, issue details (one section per
+    issue with every location), dependencies, threat model, and the removed false positives in Appendix A."""
     from xml.sax.saxutils import escape
 
     from reportlab.lib import colors
@@ -660,174 +775,293 @@ def write_pdf(r: ReportData, path: str | Path) -> Path:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import cm
-    from reportlab.platypus import (Image, KeepTogether, PageBreak, Paragraph, Preformatted, SimpleDocTemplate,
-                                    Spacer, Table, TableStyle)
+    from reportlab.platypus import (BaseDocTemplate, CondPageBreak, Frame, Image, KeepTogether, NextPageTemplate,
+                                    PageBreak, PageTemplate, Paragraph, Preformatted, Spacer, Table, TableStyle)
+    from reportlab.platypus.tableofcontents import TableOfContents
+
+    from .ai_fix import Fix
 
     navy = colors.HexColor("#1F3A5F")
+    grey = colors.HexColor("#667085")
+    line_c = colors.HexColor("#D0D5DD")
     ss = getSampleStyleSheet()
-    body = ParagraphStyle("body", parent=ss["BodyText"], fontName="Helvetica", fontSize=9.5, leading=13)
-    small = ParagraphStyle("small", parent=body, fontSize=8, leading=10)
-    h1 = ParagraphStyle("h1", parent=ss["Heading1"], textColor=navy, fontSize=15, spaceBefore=6, spaceAfter=6)
-    h2 = ParagraphStyle("h2", parent=ss["Heading2"], textColor=navy, fontSize=11.5, spaceBefore=10, spaceAfter=4)
-    label = ParagraphStyle("label", parent=body, fontName="Helvetica-Bold")
-    code_style = ParagraphStyle("code", fontName="Courier", fontSize=7, leading=8.6, backColor=colors.HexColor("#F3F4F6"),
-                                borderPadding=4, leftIndent=2)
+    body = ParagraphStyle("body", parent=ss["BodyText"], fontName="Helvetica", fontSize=9.5, leading=13.5)
+    small = ParagraphStyle("small", parent=body, fontSize=8, leading=10.4)
+    tiny = ParagraphStyle("tiny", parent=body, fontSize=7.4, leading=9.2, textColor=grey)
+    h1 = ParagraphStyle("h1", parent=ss["Heading1"], textColor=navy, fontSize=16, leading=20, spaceBefore=4,
+                        spaceAfter=8)
+    h2 = ParagraphStyle("h2", parent=ss["Heading2"], textColor=navy, fontSize=12, leading=15, spaceBefore=12,
+                        spaceAfter=5)
+    h3 = ParagraphStyle("h3", parent=body, fontName="Helvetica-Bold", fontSize=9.5, spaceBefore=6, spaceAfter=2,
+                        textColor=colors.HexColor("#344054"))
+    label = ParagraphStyle("label", parent=body, fontName="Helvetica-Bold", fontSize=8.6)
+    code_style = ParagraphStyle("code", fontName="Courier", fontSize=7, leading=8.6,
+                                backColor=colors.HexColor("#F3F4F6"), borderPadding=5, leftIndent=3, rightIndent=3)
     P = lambda t, st=body: Paragraph(escape(str(t)), st)
+    conf_hex = {"Confirmed": "B42318", "Likely real": "D9480F", "Needs review": "667085"}
+    issues = r.issues()
+    show_ai = any(i.ai for i in r.items)
 
-    def sev_para(sev):
-        return Paragraph(f'<font color="#{SEV_HEX.get(sev, "667085")}"><b>{escape(sev.capitalize())}</b></font>', small)
+    def H(text, style, level=None):
+        p = Paragraph(escape(text), style)
+        if level is not None:
+            p._toc = (level, text)
+        return p
 
-    def grid(headers, rows, widths, sev_col=None):
+    def sev_para(sev, st=small):
+        return Paragraph(f'<font color="#{SEV_HEX.get(sev, "667085")}"><b>{escape(sev.capitalize())}</b></font>', st)
+
+    def conf_para(c, st=small):
+        return Paragraph(f'<font color="#{conf_hex.get(c, "667085")}"><b>{escape(c)}</b></font>', st)
+
+    def grid(headers, rows, widths, sev_col=None, conf_col=None, zebra=True, font=small):
         data = [[Paragraph(f"<b>{escape(h)}</b>", ParagraphStyle("th", parent=small, textColor=colors.white))
                  for h in headers]]
         for row in rows:
-            data.append([sev_para(v) if i == sev_col else P(v, small) for i, v in enumerate(row)])
+            data.append([sev_para(v) if i == sev_col else conf_para(v) if i == conf_col else
+                         (v if hasattr(v, "wrap") else P(v, font)) for i, v in enumerate(row)])
         t = Table(data, colWidths=[w * cm for w in widths], repeatRows=1)
-        t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), navy), ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                               ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D0D5DD")),
-                               ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
-                               ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4)]))
+        st = [("BACKGROUND", (0, 0), (-1, 0), navy), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+              ("GRID", (0, 0), (-1, -1), 0.3, line_c), ("LEFTPADDING", (0, 0), (-1, -1), 4),
+              ("RIGHTPADDING", (0, 0), (-1, -1), 4), ("TOPPADDING", (0, 0), (-1, -1), 3),
+              ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]
+        if zebra:
+            st.append(("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]))
+        t.setStyle(TableStyle(st))
         return t
 
-    def kv(rows):
-        t = Table([[P(k, label), P(v, small)] for k, v in rows], colWidths=[4.6 * cm, 12.4 * cm])
+    def kv(rows, w1=4.2):
+        t = Table([[P(k, label), v if hasattr(v, "wrap") else P(v, small)] for k, v in rows],
+                  colWidths=[w1 * cm, (17 - w1) * cm])
         t.setStyle(TableStyle([("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EEF2F7")),
-                               ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D0D5DD")),
-                               ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+                               ("GRID", (0, 0), (-1, -1), 0.3, line_c), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+        return t
+
+    def kv2(rows):
+        """Facts two per row: label | value | label | value."""
+        cells = [(P(k, label), v if hasattr(v, "wrap") else P(v, small)) for k, v in rows]
+        if len(cells) % 2:
+            cells.append((P("", label), P("", small)))
+        data = [[a[0], a[1], b[0], b[1]] for a, b in zip(cells[::2], cells[1::2])]
+        t = Table(data, colWidths=[2.6 * cm, 5.9 * cm, 2.6 * cm, 5.9 * cm])
+        t.setStyle(TableStyle([("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EEF2F7")),
+                               ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#EEF2F7")),
+                               ("GRID", (0, 0), (-1, -1), 0.3, line_c), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+        return t
+
+    def stat_table(heads, vals, hexes, width):
+        t = Table([heads, vals], colWidths=[width * cm] * len(heads))
+        st = [("BACKGROUND", (0, 0), (-1, 0), navy), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+              ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, 0), 8.5),
+              ("FONTSIZE", (0, 1), (-1, 1), 17), ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+              ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("GRID", (0, 0), (-1, -1), 0.3, line_c),
+              ("TOPPADDING", (0, 1), (-1, 1), 9), ("BOTTOMPADDING", (0, 1), (-1, 1), 9)]
+        st += [("TEXTCOLOR", (i, 1), (i, 1), colors.HexColor("#" + h)) for i, h in enumerate(hexes)]
+        t.setStyle(TableStyle(st))
         return t
 
     def page(canvas, doc_):
         canvas.saveState()
+        canvas.setStrokeColor(line_c)
+        canvas.line(2 * cm, A4[1] - 1.3 * cm, A4[0] - 2 * cm, A4[1] - 1.3 * cm)
         canvas.setFont("Helvetica", 7.5)
-        canvas.setFillColor(colors.HexColor("#667085"))
-        canvas.drawString(2 * cm, 1.2 * cm, f"{r.project} · Source Code Security Review · Confidential")
+        canvas.setFillColor(grey)
+        canvas.drawString(2 * cm, A4[1] - 1.15 * cm, f"{r.project} · Source Code Security Review")
+        canvas.drawRightString(A4[0] - 2 * cm, A4[1] - 1.15 * cm, "Confidential")
+        canvas.drawString(2 * cm, 1.2 * cm, f"{APP_NAME} {__version__} · {r.generated}")
         canvas.drawRightString(A4[0] - 2 * cm, 1.2 * cm, f"Page {doc_.page}")
         canvas.restoreState()
 
-    story = []
-    logo = _logo_png()
-    story.append(Spacer(1, 4 * cm))
-    if logo:
-        story.append(Image(logo, width=3.2 * cm, height=3.2 * cm))
-    story += [Spacer(1, 0.6 * cm),
-              Paragraph("Source Code Security Review", ParagraphStyle("t", parent=h1, fontSize=24, alignment=TA_CENTER)),
-              Spacer(1, 0.3 * cm), Paragraph(escape(r.project), ParagraphStyle("p", parent=body, fontSize=15,
-                                                                             alignment=TA_CENTER)),
-              Spacer(1, 0.4 * cm),
-              Paragraph(f"{escape(r.generated)} · Prepared by {escape(r.prepared_by)}<br/>Confidential",
-                        ParagraphStyle("c", parent=body, alignment=TA_CENTER, textColor=colors.HexColor("#667085"))),
-              PageBreak()]
+    class Doc(BaseDocTemplate):
+        def __init__(self, filename, **kw):
+            super().__init__(filename, **kw)
+            frame = Frame(self.leftMargin, self.bottomMargin, self.width, self.height, id="f")
+            self.addPageTemplates([PageTemplate("cover", [frame], onPage=lambda c, d: None),
+                                   PageTemplate("normal", [frame], onPage=page)])
 
-    story += [Paragraph("1. Executive summary", h1), P(summary_sentence(r)), Spacer(1, 0.3 * cm)]
-    sev_t = Table([["Critical", "High", "Medium", "Low", "Info", "Total"],
-                   [str(r.by_severity.get(s, 0)) for s in SEVERITIES] + [str(len(r.items))]],
-                  colWidths=[2.8 * cm] * 6)
-    style = [("BACKGROUND", (0, 0), (-1, 0), navy), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-             ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"), ("FONTSIZE", (0, 1), (-1, 1), 16),
-             ("ALIGN", (0, 0), (-1, -1), "CENTER"), ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D0D5DD")),
-             ("TOPPADDING", (0, 1), (-1, 1), 8), ("BOTTOMPADDING", (0, 1), (-1, 1), 8)]
-    style += [("TEXTCOLOR", (i, 1), (i, 1), colors.HexColor("#" + SEV_HEX[s])) for i, s in enumerate(SEVERITIES)]
-    sev_t.setStyle(TableStyle(style))
-    story += [sev_t, Spacer(1, 0.4 * cm)]
-    fp = r.fp_counts
-    ver = Table([["True positives\n(analyst confirmed)", "To verify", "False positives removed"],
-                 [str(len(r.true_positives)), str(len(r.to_verify)), str(len(r.excluded))]],
-                colWidths=[5.6 * cm] * 3)
-    ver.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), navy), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"), ("FONTSIZE", (0, 1), (-1, 1), 16),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D0D5DD")),
-        ("TEXTCOLOR", (0, 1), (0, 1), colors.HexColor("#B42318")), ("TEXTCOLOR", (1, 1), (1, 1), colors.HexColor("#B08800")),
-        ("TEXTCOLOR", (2, 1), (2, 1), colors.HexColor("#2B8A3E")),
-        ("TOPPADDING", (0, 1), (-1, 1), 8), ("BOTTOMPADDING", (0, 1), (-1, 1), 8)]))
-    story += [ver, Spacer(1, 0.15 * cm),
-              P(f"False positives removed by: analyst {fp.get('analyst', 0)} · AI, approved by an analyst "
-                f"{fp.get('ai-approved', 0)} · AI, awaiting approval {fp.get('ai-pending', 0)} · "
-                f"documented rules {fp.get('rules', 0)}.", small), Spacer(1, 0.4 * cm)]
+        def afterFlowable(self, f):
+            toc = getattr(f, "_toc", None)
+            if toc:
+                level, text = toc
+                key = f"h{id(f)}"
+                self.canv.bookmarkPage(key)
+                self.canv.addOutlineEntry(text, key, level=level, closed=level > 0)
+                self.notify("TOCEntry", (level, text, self.page, key))
+
+    story = []
+    # ------------------------------------------------------------------ cover
+    logo = _logo_png()
+    story.append(Spacer(1, 3.2 * cm))
+    if logo:
+        story.append(Image(logo, width=3 * cm, height=3 * cm))
+    c = r.by_severity
+    story += [Spacer(1, 0.6 * cm),
+              Paragraph("Source Code Security Review", ParagraphStyle("t", parent=h1, fontSize=25, leading=30,
+                                                                       alignment=TA_CENTER)),
+              Spacer(1, 0.2 * cm),
+              Paragraph(escape(r.project), ParagraphStyle("p", parent=body, fontSize=15, leading=19,
+                                                          alignment=TA_CENTER)),
+              Spacer(1, 1.2 * cm),
+              stat_table(["Issues", "Critical", "High", "Medium", "Low", "Locations"],
+                         [str(len(issues))] + [str(c.get(s, 0)) for s in SEVERITIES[:4]] + [str(len(r.items))],
+                         ["1F3A5F"] + [SEV_HEX[s] for s in SEVERITIES[:4]] + ["1F3A5F"], 2.75),
+              Spacer(1, 1.4 * cm),
+              Paragraph(f"{escape(r.generated)}<br/>Prepared by {escape(r.prepared_by)}<br/><br/><b>Confidential</b>"
+                        f" - contains details of security weaknesses. Share only with the application owner.",
+                        ParagraphStyle("c", parent=body, alignment=TA_CENTER, textColor=grey)),
+              NextPageTemplate("normal"), PageBreak()]
+
+    # ------------------------------------------------------------------ contents
+    toc = TableOfContents()
+    toc.levelStyles = [ParagraphStyle("toc0", parent=body, fontName="Helvetica-Bold", fontSize=10, leading=15,
+                                      leftIndent=0, firstLineIndent=0),
+                       ParagraphStyle("toc1", parent=small, fontSize=8.4, leading=11.5, leftIndent=0.6 * cm,
+                                      firstLineIndent=0)]
+    toc.dotsMinLevel = 0
+    story += [Paragraph("Contents", h1), toc, PageBreak()]
+
+    # ------------------------------------------------------------------ 1 executive summary
+    story += [H("1. Executive summary", h1, 0), P(summary_sentence(r)), Spacer(1, 0.3 * cm)]
+    conf_counts = Counter(i.confidence for i in r.items)
+    story += [stat_table(["Critical", "High", "Medium", "Low", "Info", "Total"],
+                         [str(c.get(s, 0)) for s in SEVERITIES] + [str(len(r.items))],
+                         [SEV_HEX[s] for s in SEVERITIES] + ["1F3A5F"], 2.83), Spacer(1, 0.3 * cm),
+              stat_table(["Confirmed", "Likely real", "Needs review", "False positives removed"],
+                         [str(conf_counts.get("Confirmed", 0)), str(conf_counts.get("Likely real", 0)),
+                          str(conf_counts.get("Needs review", 0)), str(len(r.excluded))],
+                         ["B42318", "D9480F", "667085", "2B8A3E"], 4.25),
+              Spacer(1, 0.15 * cm),
+              P("Confirmed = checked by an analyst. Likely real = the insecure setting, secret or vulnerable version is "
+                "written in the code. Needs review = depends on whether a user can reach it. False positives are "
+                "not counted anywhere in this report - they are listed with their reasons in Appendix A.", tiny),
+              Spacer(1, 0.35 * cm)]
+    top = [x for x in issues if x.severity in ("critical", "high")][:8] or issues[:8]
+    if top:
+        story += [H("Fix first", h2),
+                  grid(["Ref", "Issue", "Severity", "Places", "Confidence"],
+                       [[x.ref, x.title, x.severity, str(len(x.items)), x.confidence] for x in top],
+                       [1.3, 9.0, 2.0, 1.6, 3.1], sev_col=2, conf_col=4)]
     cats = Counter(CAT_NAME.get(i.category, i.category) for i in r.items)
     if cats:
-        story += [P("Findings by category:", label),
-                  grid(["Category", "Findings"], [[k, v] for k, v in cats.most_common()], [8, 3])]
+        story += [H("Findings by category", h2),
+                  grid(["Category", "Issues", "Locations"],
+                       [[k, str(sum(1 for x in issues if CAT_NAME.get(x.category, x.category) == k)), str(v)]
+                        for k, v in cats.most_common()], [9, 3, 3])]
 
-    story += [Paragraph("2. Scope and evidence", h1),
+    # ------------------------------------------------------------------ 2 scope, 3 method
+    story += [PageBreak(), H("2. Scope and evidence", h1, 0),
               P("Hashes identify exactly which code was reviewed. Source hashes fingerprint the code itself and are "
                 "identical whether it was supplied as a zip or a folder."), Spacer(1, 0.2 * cm),
               kv(_inventory_rows(r.inventory))]
     langs = r.inventory.get("languages") or {}
     if langs:
-        story += [Spacer(1, 0.3 * cm),
+        story += [H("Languages", h2),
                   grid(["Language", "Files", "Code lines", "Comment lines", "Type"],
                        [[k, f"{v['files']:,}", f"{v['code']:,}", f"{v['comments']:,}",
-                         "data/config" if v.get("data") else "code"] for k, v in langs.items()], [5, 2.5, 3, 3, 3])]
+                         "data/config" if v.get("data") else "code"] for k, v in langs.items()], [5, 2.5, 3, 3, 3.5])]
     cov = r.inventory.get("coverage") or []
     if cov:
-        story += [Spacer(1, 0.3 * cm), P("Analysis coverage by language", label),
+        story += [H("Analysis coverage", h2),
                   grid(["Language", "Code lines", "Coverage", "Checked by"],
-                       [[c["language"], f"{c['code']:,}", {"full": "Full", "partial": "Partial"}.get(c["level"],
-                         "Secrets & dependencies only"), c["tools"]] for c in cov], [4, 2.5, 4, 6.5])]
+                       [[x["language"], f"{x['code']:,}", {"full": "Full", "partial": "Partial"}.get(
+                           x["level"], "Secrets & dependencies only"), x["tools"]] for x in cov], [4, 2.5, 4, 6.5])]
+    story += [CondPageBreak(8 * cm), H("3. Methodology", h1, 0), P(METHOD_TEXT), Spacer(1, 0.2 * cm),
+              kv(_method_rows(r))]
 
-    story += [Paragraph("3. Methodology", h1), P(METHOD_TEXT), Spacer(1, 0.2 * cm), kv(_method_rows(r))]
+    # ------------------------------------------------------------------ 4 overview
+    story += [PageBreak(), H("4. Issues overview", h1, 0),
+              P("Each issue is one kind of problem; the number of places shows how often it occurs. Issues are "
+                "ordered by how certain they are, then by severity.")]
+    sections = [("Confirmed", "4.1 Confirmed by an analyst"),
+                ("Likely real", "4.2 Likely real - the insecure code is visible, confirm and fix"),
+                ("Needs review", "4.3 Needs review - check whether a user can reach it")]
+    for conf, title in sections:
+        rows = [x for x in issues if x.confidence == conf]
+        story.append(H(title, h2))
+        if not rows:
+            story.append(P("None.", small))
+            continue
+        story.append(grid(["Ref", "Issue", "Severity", "Places", "Files", "Findings"],
+                          [[x.ref, x.title, x.severity, str(len(x.items)), str(x.files),
+                            (x.items[0].id if len(x.items) == 1 else f"{x.items[0].id} - {x.items[-1].id}")]
+                           for x in rows], [1.3, 8.2, 1.9, 1.5, 1.3, 2.8], sev_col=2))
 
-    story += [PageBreak(), Paragraph("4. Findings summary", h1),
-              Paragraph("4.1 True positives - confirmed by an analyst", h2)]
-    story.append(grid(["ID", "Severity", "Title", "Location", "State"],
-                      [[i.id, i.severity, i.title, i.location, i.state] for i in r.true_positives],
-                      [1.6, 1.8, 4.8, 6.4, 2.4], sev_col=1) if r.true_positives else
-                 P("None confirmed yet."))
-    story += [Paragraph("4.2 To verify - reported by the scanners, not yet confirmed", h2)]
-    story.append(grid(["ID", "Severity", "Title", "Location", "AI assessment"],
-                      [[i.id, i.severity, i.title, i.location, i.ai.split(" (")[0] if i.ai else "-"]
-                       for i in r.to_verify], [1.6, 1.8, 4.8, 6.4, 2.4], sev_col=1)
-                 if r.to_verify else P("None - every reported finding was verified."))
-
-    story += [PageBreak(), Paragraph("5. Detailed findings", h1)]
-    for i in r.items:
-        block = [Paragraph(f"{i.id}&nbsp;&nbsp;{escape(i.title)}", h2),
-                 kv([("Severity", i.severity.capitalize()),
-                     ("Verdict", "True positive (analyst confirmed)" if i.verified else "To verify"),
-                     ("State", i.state), ("Category", CAT_NAME.get(i.category, i.category)), ("Location", i.location),
-                     ("Weakness", " / ".join(x for x in (i.cwe, i.cve) if x) or "-"), ("Found by", i.tools)]
-                    + ([("AI assessment", i.ai)] if i.ai else [])
-                    + ([("Threat intel", i.intel)] if i.intel else []))]
-        story.append(KeepTogether(block))
-        if i.message:
-            story += [Spacer(1, 0.15 * cm), P("Description", label), P(i.message[:1200])]
-        code = numbered_snippet(i)
-        if code and i.category != "sca":
-            story += [Spacer(1, 0.15 * cm), P("Code", label), Preformatted(code, code_style)]
-        if i.fix:
-            fx = i.fix
-            src = ("AI-generated (" + fx["source"][3:] + ") - review and test before applying"
-                   if fx.get("source", "").startswith("ai:") else "from the scan data")
-            story += [Spacer(1, 0.15 * cm), P(f"How to fix it ({src})", label),
-                      kv([("Where", fx.get("where", "")), ("What is wrong", fx.get("what", ""))]
-                         + ([("Attack example", fx["attack"])] if fx.get("attack") else []))]
-            for n, st in enumerate(fx.get("steps", []), 1):
-                story.append(P(f"{n}. {st}"))
-            from .ai_fix import Fix
+    # ------------------------------------------------------------------ 5 details
+    story += [PageBreak(), H("5. Issue details", h1, 0)]
+    for x in issues:
+        lead = x.lead
+        head = f"{x.ref}  {x.title}" + (f"  ({len(x.items)} places)" if len(x.items) > 1 else "")
+        facts = [("Severity", sev_para(x.severity)), ("Confidence", conf_para(x.confidence)),
+                 ("Why", lead.why or "-"), ("Category", CAT_NAME.get(x.category, x.category)),
+                 ("Weakness", " / ".join(v for v in (lead.cwe, ", ".join(sorted({i.cve for i in x.items if i.cve})))
+                                         if v) or "-"),
+                 ("Found by", lead.tools)]
+        if x.category == "sca":
+            facts.insert(4, ("Upgrade to", x.fixed or "no fixed version published yet"))
+        if any(i.exploited for i in x.items):
+            facts.insert(2, ("Exploited", Paragraph('<font color="#B42318"><b>Yes - listed in CISA KEV</b></font>',
+                                                    small)))
+        if show_ai and lead.ai:
+            facts.append(("AI assessment", lead.ai))
+        story.append(KeepTogether([CondPageBreak(5 * cm), H(head, h2, 1), kv2(facts)]))
+        msg = re.sub(r"\s+", " ", lead.message or "").strip()
+        if msg and x.category != "sca":
+            story += [H("What is wrong", h3), P(msg[:900] + ("..." if len(msg) > 900 else ""))]
+        # every location
+        if x.category == "sca":
+            loc_rows = [[i.id, i.cve or i.title, i.severity, i.fixed or "-",
+                         "YES (KEV)" if i.exploited else (i.intel.split(" chance")[0] if i.intel else "-")]
+                        for i in x.items]
+            story += [H("Advisories", h3), grid(["ID", "Advisory", "Severity", "Fixed in", "Exploited"], loc_rows,
+                                                [1.6, 5.4, 2.0, 3.6, 4.4], sev_col=2)]
+        else:
+            loc_rows = [[i.id, i.location, i.state if i.state != TO_VERIFY else i.confidence] for i in x.items]
+            story += [H("Where" + (f" ({len(x.items)} places)" if len(x.items) > 1 else ""), h3),
+                      grid(["ID", "File and line", "Status"], loc_rows, [1.6, 12.2, 3.2])]
+        code = numbered_snippet(lead)
+        if code and x.category != "sca":
+            story += [H(f"Code ({lead.id})", h3), Preformatted(code, code_style)]
+        if lead.fix:
+            fx = lead.fix
+            src = ("AI-generated - review and test before applying" if fx.get("source", "").startswith("ai:")
+                   else "from the scan data")
+            story += [H(f"How to fix it ({src})", h3)]
+            if fx.get("what"):
+                story.append(P(fx["what"], small))
+            for n_, st_ in enumerate(fx.get("steps", []), 1):
+                story.append(P(f"{n_}. {st_}", small))
             diff = Fix.from_dict(fx).diff()
             if diff:
-                story += [Spacer(1, 0.1 * cm), P("Change", label), Preformatted(diff[:3000], code_style)]
+                story += [Spacer(1, 0.1 * cm), Preformatted(diff[:2500], code_style)]
+            if len(x.items) > 1 and x.category != "sca":
+                story.append(P(f"Make the same change at the other {len(x.items) - 1} place"
+                               f"{'s' if len(x.items) > 2 else ''} listed above.", small))
             if fx.get("verify"):
-                story.append(P(f"Verify: {fx['verify']}", small))
+                story.append(P(f"Verify: {fx['verify']}", tiny))
         else:
-            story += [Spacer(1, 0.15 * cm), P("Recommendation", label), P(i.recommendation)]
-        if i.note:
-            story += [P("Analyst note", label), P(i.note)]
-        story.append(Spacer(1, 0.4 * cm))
+            story += [H("How to fix it", h3), P(lead.recommendation, small)]
+        notes = [f"{i.id}: {i.note}" for i in x.items if i.note]
+        if notes:
+            story += [H("Analyst notes", h3)] + [P(n_, small) for n_ in notes[:10]]
+        story.append(Spacer(1, 0.3 * cm))
 
-    if r.sca:
-        story += [Paragraph("6. Vulnerable dependencies", h1),
-                  grid(["ID", "Package", "Installed", "Fixed in", "Vulnerability", "Severity", "Exploited?"],
-                       [[i.id, i.package, i.version, i.fixed or "-", i.cve or i.title, i.severity,
-                         "YES (CISA KEV)" if i.exploited else (i.intel.split(" chance")[0] if i.intel else "-")]
-                        for i in r.sca], [1.5, 3.2, 2.0, 2.2, 3.4, 1.8, 2.9], sev_col=5)]
+    # ------------------------------------------------------------------ 6 dependencies
+    sca_issues = [x for x in issues if x.category == "sca"]
+    if sca_issues:
+        story += [CondPageBreak(6 * cm), H("6. Vulnerable dependencies", h1, 0),
+                  P("One row per package. Upgrading to the version shown fixes every advisory listed for it."),
+                  grid(["Ref", "Package", "Installed", "Upgrade to", "Advisories", "Worst", "Exploited"],
+                       [[x.ref, x.items[0].package, x.items[0].version, x.fixed or "-", str(len(x.items)),
+                         x.severity, "YES (KEV)" if any(i.exploited for i in x.items) else "-"] for x in sca_issues],
+                       [1.3, 4.2, 2.2, 2.6, 2.2, 2.0, 2.5], sev_col=5)]
 
+    # ------------------------------------------------------------------ 7 threat model
     if r.threat_model:
         tm = r.threat_model
         s_ = tm.get("summary", {})
-        story += [PageBreak(), Paragraph("7. Threat model", h1),
+        story += [PageBreak(), H("7. Threat model", h1, 0),
                   P("Generated from the source code and the findings, then reviewed by the analyst. It shows how data "
                     "enters the application, where it is stored and which third parties receive it, with STRIDE "
                     "threats for each element. Threats proven by a finding are listed first.")]
@@ -835,9 +1069,9 @@ def write_pdf(r: ReportData, path: str | Path) -> Path:
             from reportlab.lib.utils import ImageReader
             iw, ih = ImageReader(r.tm_image).getSize()
             w = 17 * cm
-            h = min(w * ih / iw, 20 * cm)
-            story += [Spacer(1, 0.2 * cm), Image(r.tm_image, width=h * iw / ih, height=h),
-                      P("Red arrows cross a trust boundary; red badges count threats proven by findings.", small)]
+            hh = min(w * ih / iw, 19 * cm)
+            story += [Spacer(1, 0.2 * cm), Image(r.tm_image, width=hh * iw / ih, height=hh),
+                      P("Red arrows cross a trust boundary; red badges count threats proven by findings.", tiny)]
         story += [Spacer(1, 0.2 * cm), kv([
             ("Frameworks", ", ".join(s_.get("frameworks", [])) or "-"),
             ("Entry points", f"{s_.get('entry_points', 0)} routes in "
@@ -846,37 +1080,53 @@ def write_pdf(r: ReportData, path: str | Path) -> Path:
             ("Data stores", ", ".join(s_.get("stores", [])) or "-"),
             ("Third parties", ", ".join(s_.get("services", [])) or "-"),
             ("Controls seen", ", ".join(s_.get("mitigations_seen", [])) or "-")]),
-            Spacer(1, 0.3 * cm), P("STRIDE summary", label),
+            H("STRIDE summary", h2),
             grid(["Threat type", "Threats", "Proven by findings", "Need review", "Controlled / N/A"],
                  r.tm_stride(), [5, 2.4, 3.4, 3, 3.2]),
-            Spacer(1, 0.3 * cm), P("Threats that need action", label)]
+            H("Threats that need action", h2)]
         rows = r.tm_rows()
         story.append(grid(["ID", "STRIDE", "Element", "Threat", "Status", "Findings"], rows,
-                          [1.4, 2.4, 3.4, 5.8, 2.2, 1.8]) if rows else P("None - all threats are mitigated or not applicable."))
+                          [1.4, 2.4, 3.4, 5.8, 2.2, 1.8]) if rows else
+                     P("None - all threats are mitigated or not applicable."))
 
-    story += [PageBreak(), Paragraph("Appendix A. False positives (excluded findings)", h1),
-              P("Every finding left out of the report, grouped by who decided it is not a real issue."),
-              Spacer(1, 0.2 * cm)]
-    groups = [("analyst", "Judged not exploitable by an analyst"),
-              ("ai-approved", "Proposed by the AI and approved by an analyst"),
-              ("ai-pending", "Proposed by the AI - awaiting analyst approval (treat with care)"),
-              ("rules", "Removed by documented rules (test code, placeholders, vendored code...)")]
+    # ------------------------------------------------------------------ appendix A
+    story += [PageBreak(), H("Appendix A. False positives removed", h1, 0),
+              P("These results were reported by a scanner but are not real issues. They are kept here so the review "
+                "can be audited. Summary first, then every location grouped by reason.")]
     if not r.excluded:
         story.append(P("None."))
-    for kind, title in groups:
-        rows = [e for e in r.excluded if e.get("kind", "rules") == kind]
-        if rows:
-            story += [Paragraph(f"{title} ({len(rows)})", h2),
-                      grid(["Location", "Rule", "Reason", "By"],
-                           [[e["location"], e["rule"], e["reason"], e["by"]] for e in rows], [5.2, 3.4, 6.2, 2.2])]
-    story += [Paragraph("Appendix B. Limitations", h1), P(DISCLAIMER)]
+    else:
+        by_reason = Counter((e.get("kind", "rules"), _reason_key(e["reason"])) for e in r.excluded)
+        who = {"analyst": "Analyst", "ai-approved": "AI + analyst", "ai-pending": "AI (awaiting approval)",
+               "rules": "Documented rule"}
+        story += [H("Summary", h2),
+                  grid(["Reason", "Decided by", "Results"],
+                       [[reason, who.get(kind, kind), str(n)] for (kind, reason), n in by_reason.most_common()],
+                       [11, 3.6, 2.4])]
+        for (kind, reason), n in by_reason.most_common():
+            rows = [e for e in r.excluded if e.get("kind", "rules") == kind and _reason_key(e["reason"]) == reason]
+            story += [CondPageBreak(3 * cm), H(f"{reason} ({n})", h2),
+                      grid(["Location", "Rule", "Detail"],
+                           [[e["location"], e["rule"], e["reason"] if e["reason"] != reason else "-"] for e in rows],
+                           [7.2, 4.0, 5.8], font=tiny)]
+    story += [CondPageBreak(5 * cm), H("Appendix B. Limitations", h1, 0), P(DISCLAIMER)]
 
     path = Path(path)
-    SimpleDocTemplate(str(path), pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm, topMargin=1.8 * cm,
-                      bottomMargin=1.8 * cm, title=f"{r.project} - Source Code Security Review",
-                      author=r.prepared_by, creator=f"{APP_NAME} {__version__}").build(
-        story, onFirstPage=lambda c, d: None, onLaterPages=page)
+    doc = Doc(str(path), pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm, topMargin=1.9 * cm,
+              bottomMargin=1.8 * cm, title=f"{r.project} - Source Code Security Review", author=r.prepared_by,
+              creator=f"{APP_NAME} {__version__}")
+    doc.multiBuild(story)
     return path
+
+
+def _reason_key(reason: str) -> str:
+    """Group similar exclusion reasons ('Inside the third-party library 'x' ...' -> one group)."""
+    rs = reason or "Rule filter"
+    m = re.match(r"Inside the third-party library '([^']+)'", rs)
+    if m:
+        return "Inside a third-party library copied into the project"
+    rs = re.sub(r"^(Not Exploitable|Proposed Not Exploitable):\s*", r"\1: ", rs)
+    return rs.split(" - ")[0].split(" (")[0][:110]
 
 
 def export_all(r: ReportData, folder: str | Path, formats=("pdf", "docx", "xlsx")) -> list[Path]:
