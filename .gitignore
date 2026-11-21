@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+scans/
+out/
+*.db
+*.jsonl
+ai-models/
+ai-bundles/
+backups/
+knowledge/
+logs/

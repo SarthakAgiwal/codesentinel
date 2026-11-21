@@ -1,0 +1,125 @@
+# CodeSentinel's own rules for PHP and for JavaScript written inside server-side pages (PHP, ASP.NET, JSP...).
+# Added after comparing with a Checkmarx scan of a PHP (CodeIgniter) application: the community rules only read
+# .js files, so DOM XSS and open redirects in <script> blocks of .php / .aspx views were missed.
+rules:
+  - id: codesentinel.inline-js.dom-xss
+    languages: [regex]
+    severity: WARNING
+    paths:
+      include: ["*.php", "*.phtml", "*.html", "*.htm", "*.aspx", "*.ascx", "*.master", "*.cshtml", "*.jsp", "*.erb", "*.twig"]
+    message: >-
+      Script on this page writes a value that is not a fixed string into the page as HTML (innerHTML,
+      outerHTML, insertAdjacentHTML, document.write or jQuery .html()/.append()). If any part of it comes from
+      the user, the URL or an API response, an attacker can run JavaScript in the victim's browser (DOM XSS).
+      Use textContent / innerText (or jQuery .text()) for text, or escape every value before building HTML.
+    metadata:
+      category: security
+      cwe: ["CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"]
+      confidence: MEDIUM
+    pattern-either:
+      - pattern-regex: \.(?:innerHTML|outerHTML)\s*\+?=\s*(?!\s*(?:'[^'$]*'|"[^"$]*"|``)\s*;)(?!\s*['"]\s*;)\S
+      - pattern-regex: \.insertAdjacentHTML\s*\(\s*['"]\w+['"]\s*,\s*(?!['"][^'"$]*['"]\s*\))\S
+      - pattern-regex: \bdocument\.write(?:ln)?\s*\(\s*(?!['"][^'"$]*['"]\s*\))\S
+      - pattern-regex: (?:\$\([^)]*\)|\$\w+|\bjQuery\([^)]*\))\.(?:html|append|prepend|after|before|replaceWith)\s*\(\s*(?!\)|['"][^'"$]*['"]\s*\))(?=[^)]*(?:\+|\$\{|\w\s*\)))
+
+  - id: codesentinel.inline-js.open-redirect
+    languages: [regex]
+    severity: INFO
+    paths:
+      include: ["*.php", "*.phtml", "*.html", "*.htm", "*.aspx", "*.ascx", "*.cshtml", "*.jsp", "*.js", "*.jsx", "*.ts", "*.tsx"]
+    message: >-
+      The page navigates to an address taken from the URL (query string, hash or a 'url'/'redirect'/'next'
+      parameter). An attacker can send a link that bounces the user to a phishing site that looks like it came
+      from this application (open redirect), or use a javascript: address to run script. Only allow relative
+      paths or addresses from an allow-list.
+    metadata:
+      category: security
+      cwe: ["CWE-601: URL Redirection to Untrusted Site ('Open Redirect')"]
+      confidence: MEDIUM
+    pattern-regex: (?:\blocation(?:\.href)?\s*=|\blocation\.(?:assign|replace)\s*\(|\bwindow\.open\s*\()[^;\n]*(?:searchParams|URLSearchParams|location\.(?:search|hash)|\.get\(\s*['"](?:url|redirect|redirect_?url|return|return_?url|returnUrl|next|goto|target|dest|continue)['"])
+
+  - id: codesentinel.php.insecure-randomness
+    languages: [php]
+    severity: WARNING
+    message: >-
+      $FN() is not a cryptographically secure random generator - its output can be predicted. Do not use it for
+      OTPs, passwords, reset or API tokens, transaction / order IDs or file names that must not be guessed.
+      Use random_int() for numbers and bin2hex(random_bytes(16)) for tokens.
+    metadata:
+      category: security
+      cwe: ["CWE-330: Use of Insufficiently Random Values"]
+      confidence: MEDIUM
+    patterns:
+      - pattern: $FN(...)
+      - metavariable-regex:
+          metavariable: $FN
+          regex: ^(rand|mt_rand|uniqid|lcg_value|str_shuffle|array_rand|mt_srand|srand)$
+
+  - id: codesentinel.php.cookie-without-httponly
+    languages: [regex]
+    severity: WARNING
+    paths:
+      include: ["*.php"]
+    message: >-
+      This cookie is set without the HttpOnly flag (and possibly without Secure / SameSite), so any script on the
+      page can read it and an XSS bug becomes session theft. Pass an options array:
+      setcookie($name, $value, ['expires' => $t, 'path' => '/', 'secure' => true, 'httponly' => true,
+      'samesite' => 'Strict']).
+    metadata:
+      category: security
+      cwe: ["CWE-1004: Sensitive Cookie Without 'HttpOnly' Flag"]
+      confidence: MEDIUM
+    pattern-regex: \b(?:setcookie|setrawcookie|set_cookie)\s*\((?![^;]*[Hh][Tt][Tt][Pp][Oo][Nn][Ll][Yy])(?![^;]*,\s*true\s*\)\s*;)[^;]*;
+
+  - id: codesentinel.php.hardcoded-credential
+    languages: [regex]
+    severity: WARNING
+    paths:
+      include: ["*.php"]
+      exclude: ["**/Config/Boot/*", "**/tests/**", "**/vendor/**"]
+    message: >-
+      A password, key or secret is written directly in the PHP code. Anyone with the source (a developer, a
+      backup, a leaked repository) has it, and it cannot be changed without a release. Move it to the
+      environment (.env outside the web root, or a secrets manager) and read it with getenv() / env(), then
+      rotate the old value.
+    metadata:
+      category: security
+      cwe: ["CWE-798: Use of Hard-coded Credentials"]
+      confidence: MEDIUM
+    pattern-either:
+      - pattern-regex: (?i)\$\w*(?:passw(?:or)?d|passwd|\bpwd|secret|api_?key|private_?key|enc(?:ryption)?_?key|secret_?key|access_?token|auth_?token)\w*\s*=\s*['"](?!\s*['"])[^'"\s$]{6,}['"]\s*;
+      - pattern-regex: (?i)['"](?:password|passwd|pwd|secret|api_?key|secret_?key|private_?key|access_?token)['"]\s*=>\s*['"][^'"\s$]{6,}['"]
+      - pattern-regex: (?i)\b(?:private|protected|public|var|const)\s+(?:static\s+)?\$?\w*(?:key|secret|salt|\biv)\w*\s*=\s*['"][^'"\s$]{8,}['"]
+      - pattern-regex: (?i)\bdefine\(\s*['"]\w*(?:PASSWORD|PASS|SECRET|API_?KEY|PRIVATE_?KEY|ENC(?:RYPTION)?_?KEY|TOKEN)\w*['"]\s*,\s*['"][^'"\s$]{6,}['"]
+
+  - id: codesentinel.php.display-errors-enabled
+    languages: [regex]
+    severity: INFO
+    paths:
+      include: ["*.php", "*.ini", ".user.ini", ".htaccess"]
+      exclude: ["**/Config/Boot/development.php", "**/Config/Boot/testing.php", "**/tests/**"]
+    message: >-
+      PHP errors are shown to visitors. Error pages then reveal file paths, SQL queries and library versions that
+      help an attacker. Set display_errors = Off in production and log errors instead (log_errors = On).
+    metadata:
+      category: security
+      cwe: ["CWE-209: Generation of Error Message Containing Sensitive Information"]
+      confidence: HIGH
+    pattern-either:
+      - pattern-regex: (?i)ini_set\(\s*['"]display_errors['"]\s*,\s*['"]?(?:1|on|true|stdout)['"]?\s*\)
+      - pattern-regex: (?im)^\s*(?:php_flag\s+)?display_errors\s*=?\s*(?:1|on)\s*$
+
+  - id: codesentinel.php.test-endpoint-in-production
+    languages: [regex]
+    severity: WARNING
+    paths:
+      include: ["**/Controllers/*Test*.php", "**/controllers/*test*.php", "**/Controllers/*Debug*.php", "**/public/*test*.php", "**/public/*debug*.php", "**/public/phpinfo.php", "**/public/info.php"]
+    message: >-
+      A test or debug page is part of the deployed application. These pages usually skip authentication and
+      reveal configuration, database details or let anyone call internal APIs. Remove it from production
+      (or block the route) before release.
+    metadata:
+      category: security
+      cwe: ["CWE-489: Active Debug Code"]
+      confidence: HIGH
+    pattern-regex: \A\s*<\?php

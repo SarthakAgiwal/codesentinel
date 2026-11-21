@@ -1,0 +1,49 @@
+# CodeSentinel's own rules - always run with Semgrep, next to the community rules.
+# Added after comparing with a Checkmarx scan: these weaknesses were found there and not by the community rules.
+rules:
+  - id: codesentinel.js.sensitive-data-in-web-storage
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A token, password or session value is stored in $STORE. Any JavaScript on the page (for example an XSS
+      payload or a compromised third-party script) can read Web Storage, so the value can be stolen. Keep
+      session tokens in HttpOnly, Secure, SameSite cookies set by the server, or in memory only.
+    metadata:
+      category: security
+      cwe: ["CWE-922: Insecure Storage of Sensitive Information"]
+      owasp: ["A04:2021 - Insecure Design", "A02:2021 - Cryptographic Failures"]
+      confidence: MEDIUM
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: $STORE.setItem($KEY, ...)
+              - pattern: $STORE[$KEY] = $VAL
+          - metavariable-regex:
+              metavariable: $STORE
+              regex: ^(window\.)?(localStorage|sessionStorage)$
+          - metavariable-regex:
+              metavariable: $KEY
+              regex: (?i).*(token|jwt|passw|secret|auth|session|credential|api_?key|refresh|bearer).*
+      - patterns:
+          - pattern: $STORE.$PROP = $VAL
+          - metavariable-regex:
+              metavariable: $STORE
+              regex: ^(window\.)?(localStorage|sessionStorage)$
+          - metavariable-regex:
+              metavariable: $PROP
+              regex: (?i).*(token|jwt|passw|secret|auth|session|credential|api_?key|refresh|bearer).*
+
+  - id: codesentinel.html.target-blank-without-noopener
+    languages: [regex]
+    severity: INFO
+    paths:
+      include: ["*.html", "*.htm", "*.jsx", "*.tsx", "*.vue", "*.svelte", "*.php", "*.erb", "*.cshtml", "*.jsp"]
+    message: >-
+      This link opens a new tab with target="_blank" but has no rel="noopener noreferrer". On older browsers the
+      opened page can use window.opener to redirect this page to a phishing site (reverse tabnabbing). Add
+      rel="noopener noreferrer" to the link.
+    metadata:
+      category: security
+      cwe: ["CWE-1022: Use of Web Link to Untrusted Target with window.opener Access"]
+      confidence: HIGH
+    pattern-regex: <a\b(?![^>]*\brel\s*=\s*\{?\s*["'][^"']*noopener)[^>]*\btarget\s*=\s*\{?\s*["']_blank["']\s*\}?[^>]*>
