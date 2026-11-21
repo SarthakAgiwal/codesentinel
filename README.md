@@ -33,7 +33,7 @@ and the app are applied only after you approve them.
 Requires Python 3.11+.
 
 ```powershell
-git clone https://github.com/<your-account>/codesentinel.git
+git clone https://github.com/SarthakAgiwal/codesentinel.git
 cd codesentinel
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # Linux: source .venv/bin/activate
